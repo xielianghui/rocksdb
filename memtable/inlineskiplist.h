@@ -783,6 +783,7 @@ InlineSkipList<Comparator>::InlineSkipList(const Comparator cmp,
 
 template <class Comparator>
 char* InlineSkipList<Comparator>::AllocateKey(size_t key_size) {
+  // 调用 Key() 函数来获取 key 的起始地址
   return const_cast<char*>(AllocateNode(key_size, RandomHeight())->Key());
 }
 
@@ -813,6 +814,7 @@ InlineSkipList<Comparator>::AllocateNode(size_t key_size, int height) {
 template <class Comparator>
 typename InlineSkipList<Comparator>::Splice*
 InlineSkipList<Comparator>::AllocateSplice() {
+  // splice 内存布局也是连续的，以此来提高性能
   // size of prev_ and next_
   size_t array_size = sizeof(Node*) * (kMaxHeight_ + 1);
   char* raw = allocator_->AllocateAligned(sizeof(Splice) + array_size * 2);
@@ -847,6 +849,7 @@ bool InlineSkipList<Comparator>::InsertConcurrently(const char* key) {
   Splice splice;
   splice.prev_ = prev;
   splice.next_ = next;
+  // 并行插入时提供都属于自己的 Splice，并且 UseCAS 设置为 true
   return Insert<true>(key, &splice, false);
 }
 
@@ -879,9 +882,13 @@ void InlineSkipList<Comparator>::FindSpliceForLevel(const DecodedKey& key,
                                                     Node* before, Node* after,
                                                     int level, Node** out_prev,
                                                     Node** out_next) {
+  // Splice 重新计算的方式就是在确保上一层，即 before -> after，紧凑包围了 key
+  // 后，查找下一层。下一层的查找起始点就是 before，结束点就是 after。
   while (true) {
+    // level 是本次计算的层数
     Node* next = before->Next(level);
     if (next != nullptr) {
+      // 预取操作
       PREFETCH(next->Next(level), 0, 1);
     }
     if (prefetch_before == true) {
@@ -894,10 +901,14 @@ void InlineSkipList<Comparator>::FindSpliceForLevel(const DecodedKey& key,
     assert(before == head_ || KeyIsAfterNode(key, before));
     if (next == after || !KeyIsAfterNode(key, next)) {
       // found it
+      // 如果 key 在 next 前面，那么说明 before -> next 包围了 key
+      // 如果 next == after，这表示查找结束，此时 before -> next 也一定包围了
+      // key
       *out_prev = before;
       *out_next = next;
       return;
     }
+    // 如果没有结束并且 key 在 next 后面，将 before 往后推且继续查找
     before = next;
   }
 }
@@ -909,6 +920,7 @@ void InlineSkipList<Comparator>::RecomputeSpliceLevels(const DecodedKey& key,
   assert(recompute_level > 0);
   assert(recompute_level <= splice->height_);
   for (int i = recompute_level - 1; i >= 0; --i) {
+    // 从 levels recompute_level 已经紧凑包围了 key 的这一层逐步往下查找计算
     FindSpliceForLevel<true>(key, splice->prev_[i + 1], splice->next_[i + 1], i,
                              &splice->prev_[i], &splice->next_[i]);
   }
@@ -918,11 +930,14 @@ template <class Comparator>
 template <bool UseCAS>
 bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
                                         bool allow_partial_splice_fix) {
+  // 从 AllocateNode 中可以知道 key 前面的内存是用于保存连续的 atomic<Node*> 的
+  // 并且这时候 Node[0] 的内存暂时用于保存 height
   Node* x = reinterpret_cast<Node*>(const_cast<char*>(key)) - 1;
   const DecodedKey key_decoded = compare_.decode_key(key);
   int height = x->UnstashHeight();
   assert(height >= 1 && height <= kMaxHeight_);
 
+  // max_height_ 默认值为 1，这里 CAS 更新 max_height_
   int max_height = max_height_.load(std::memory_order_relaxed);
   while (height > max_height) {
     if (max_height_.compare_exchange_weak(max_height, height)) {
@@ -935,14 +950,23 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
   }
   assert(max_height <= kMaxPossibleHeight);
 
+  // recompute_height 表示 Splice 需要从上往下重新查找的高度，换句话说
+  // recompute_height 及 recompute_height 以上的层是紧凑包围 key
+  // 的，不需要重新查找 recompute_height 以下的层不是紧凑包围 key
+  // 的，需要重新查找
   int recompute_height = 0;
+  // splice->height_ 默认值为 0
   if (splice->height_ < max_height) {
     // Either splice has never been used or max_height has grown since
     // last use.  We could potentially fix it in the latter case, but
     // that is tricky.
+
+    // head_ 是一个拥有所有 level Node（初始值为 nullptr） 但是 key 为空的 Node
     splice->prev_[max_height] = head_;
     splice->next_[max_height] = nullptr;
     splice->height_ = max_height;
+    // 如果 Splice 的高度小于 max_height，那么我们就从 Splice
+    // 的最高层从头开始往下查找，此时的插入查找时间复杂度退化为 O(logn)
     recompute_height = max_height;
   } else {
     // Splice is a valid proper-height splice that brackets some
@@ -973,6 +997,11 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
     // A good strategy is probably to be pessimistic for seq_splice_,
     // optimistic if the caller actually went to the work of providing
     // a Splice.
+
+    // 从 levels 0 层开始往上判断，如果当前层能够包围
+    // key，那么表示从该层开始往上的所有层都包围了 key。
+    // 特别的，如果 levels 0 层就已经包围了
+    // key，那么这一次插入查找的时间复杂度为 O(1)
     while (recompute_height < max_height) {
       if (splice->prev_[recompute_height]->Next(recompute_height) !=
           splice->next_[recompute_height]) {
@@ -985,23 +1014,30 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
         // our budget of comparisons, so always move up even if we are
         // pessimistic about
         // our chances of success.
+
+        // 这里表示 Splice 的这一层不是紧凑的，意味着有插入操作但是没有更新这个
+        // Splice，也就是 Splice 不是新鲜的
         ++recompute_height;
       } else if (splice->prev_[recompute_height] != head_ &&
                  !KeyIsAfterNode(key_decoded,
                                  splice->prev_[recompute_height])) {
+        // 这里表示 Splice 的这一层没有包围 key，并且 key 的位置在 prev_ 前面
         // key is from before splice
         if (allow_partial_splice_fix) {
           // skip all levels with the same node without more comparisons
+          // 跳过 Splice 上面拥有相同 prev 的层，并且继续往上查找
           Node* bad = splice->prev_[recompute_height];
           while (splice->prev_[recompute_height] == bad) {
             ++recompute_height;
           }
         } else {
           // we're pessimistic, recompute everything
+          // 悲观策略，直接结束 Splice 的查找，从头开始查找计算 Splice
           recompute_height = max_height;
         }
       } else if (KeyIsAfterNode(key_decoded, splice->next_[recompute_height])) {
         // key is from after splice
+        // 这里表示 Splice 的这一层没有包围 key，并且 key 的位置在 next_ 后面
         if (allow_partial_splice_fix) {
           Node* bad = splice->next_[recompute_height];
           while (splice->next_[recompute_height] == bad) {
@@ -1012,17 +1048,23 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
         }
       } else {
         // this level brackets the key, we won!
+        // 在 Splice 中找到了紧凑包围 key 的一层
         break;
       }
     }
   }
   assert(recompute_height <= max_height);
   if (recompute_height > 0) {
+    // recompute_height > 0 表示 Splice 中 [0, recompute_height)
+    // 的层需要重新计算
+    // recompute_height == 0 表示 Spilce 所有层都紧凑包围 key，直接插入即可
     RecomputeSpliceLevels(key_decoded, splice, recompute_height);
   }
 
   bool splice_is_valid = true;
   if (UseCAS) {
+    // 并行插入时 Splice 都是各自私有且为空的，也就是并行插入时 Splice
+    // 不起优化作用
     for (int i = 0; i < height; ++i) {
       while (true) {
         // Checking for duplicate keys on the level 0 is sufficient
@@ -1043,6 +1085,8 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
         x->NoBarrier_SetNext(i, splice->next_[i]);
         if (splice->prev_[i]->CASNext(i, splice->next_[i], x)) {
           // success
+          // CAS 成功，说明没有其他线程在 splice->prev_[i]， splice->next_[i]
+          // 中插入了 Node
           break;
         }
         // CAS failed, we need to recompute prev and next. It is unlikely
@@ -1050,12 +1094,18 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
         // search, because it should be unlikely that lots of nodes have
         // been inserted between prev[i] and next[i]. No point in using
         // next[i] as the after hint, because we know it is stale.
+
+        // CAS 失败说明有其他线程在 splice->prev_[i]， splice->next_[i] 中插入了
+        // Node 需要重新计算 Splice
         FindSpliceForLevel<false>(key_decoded, splice->prev_[i], nullptr, i,
                                   &splice->prev_[i], &splice->next_[i]);
 
         // Since we've narrowed the bracket for level i, we might have
         // violated the Splice constraint between i and i-1.  Make sure
         // we recompute the whole thing next time.
+
+        // 这里重新计算 Splice 的 i 层，也就是缩小了 i 层的范围，这可能违反了第
+        // i 层和第 i-1 层之间的约束，将整个 Splice 设置为 invalid
         if (i > 0) {
           splice_is_valid = false;
         }
@@ -1065,6 +1115,8 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
     for (int i = 0; i < height; ++i) {
       if (i >= recompute_height &&
           splice->prev_[i]->Next(i) != splice->next_[i]) {
+        // 前面判断是否紧凑的时候 recompute_height 后面没有判断
+        // 如果不是紧凑的需要重新计算为紧凑的
         FindSpliceForLevel<false>(key_decoded, splice->prev_[i], nullptr, i,
                                   &splice->prev_[i], &splice->next_[i]);
       }
@@ -1084,12 +1136,15 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
       assert(splice->prev_[i] == head_ ||
              compare_(splice->prev_[i]->Key(), x->Key()) < 0);
       assert(splice->prev_[i]->Next(i) == splice->next_[i]);
+      // 前面的重新计算已经保证了 Splice 这一层是紧凑且包围 key
+      // 的，所以在这里进行插入
       x->NoBarrier_SetNext(i, splice->next_[i]);
       splice->prev_[i]->SetNext(i, x);
     }
   }
   if (splice_is_valid) {
     for (int i = 0; i < height; ++i) {
+      // 插入完成后更新 Splice 中的 prev_，保证 Splice 新鲜
       splice->prev_[i] = x;
     }
     assert(splice->prev_[splice->height_] == head_);
